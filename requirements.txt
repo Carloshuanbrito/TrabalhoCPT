@@ -2,5 +2,3 @@ numpy
 pandas
 matplotlib
 jupyter
-notebook
-ipykernel

@@ -1,21 +1,24 @@
 """
-Cliente para multiplicacao de matrizes distribuida.
+Cliente do PROJETOCP - multiplicacao de matrizes distribuida.
 
-O cliente gera as matrizes A e B, divide A em blocos de linhas, envia cada bloco
-para um servidor worker e concatena os resultados parciais para formar C = A x B.
-Tambem executa a versao serial para comparar tempo e speedup.
+Fluxo:
+1. Gera matrizes A e B aleatoriamente com NumPy.
+2. Executa a multiplicacao serial local para comparacao.
+3. Divide A em submatrizes e envia para a quantidade de servidores informada.
+4. Recebe os resultados parciais, monta C e salva os tempos no CSV.
+5. Salva as matrizes da ultima execucao em last_run_matrices.json.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import pickle
 import socket
 import struct
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,11 +26,16 @@ from typing import Any
 import numpy as np
 
 
-HEADER_FORMAT = "!Q"  # unsigned long long em network byte order
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-DEFAULT_HOST = "127.0.0.1"
+# Configuracoes obrigatorias do trabalho
+DEFAULT_SERVER_HOST = "localhost"
 DEFAULT_START_PORT = 5000
-DEFAULT_SIZES = "20,100,500,1000"
+DEFAULT_NUM_SERVERS = 2
+MATRIX_SIZES = [20, 50, 100, 200]
+DTYPE = np.int16
+VALUE_RANGE = (1, 10)  # np.random.randint usa limite superior exclusivo: valores de 1 a 9
+
+CSV_PATH = Path("benchmark_results.csv")
+LAST_RUN_JSON_PATH = Path("last_run_matrices.json")
 CSV_COLUMNS = [
     "matrix_size",
     "serial_time_ms",
@@ -37,35 +45,28 @@ CSV_COLUMNS = [
     "timestamp",
 ]
 
-
-@dataclass(frozen=True)
-class ServerSpec:
-    """Representa o endereco de um servidor worker."""
-
-    host: str
-    port: int
-
-    @property
-    def label(self) -> str:
-        return f"{self.host}:{self.port}"
+HEADER_FORMAT = "!Q"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+SOCKET_TIMEOUT_SECONDS = 120
+SEPARATOR = "=" * 60
 
 
 def send_pickle(sock: socket.socket, obj: Any) -> None:
-    """Serializa e envia um objeto pelo socket com cabecalho de tamanho."""
-    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    sock.sendall(struct.pack(HEADER_FORMAT, len(data)))
-    sock.sendall(data)
+    """Serializa um objeto com pickle e envia precedido do tamanho em bytes."""
+    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    sock.sendall(struct.pack(HEADER_FORMAT, len(payload)))
+    sock.sendall(payload)
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
-    """Recebe exatamente size bytes do socket."""
+    """Recebe exatamente a quantidade de bytes solicitada."""
     chunks: list[bytes] = []
     received = 0
 
     while received < size:
         chunk = sock.recv(size - received)
         if not chunk:
-            raise ConnectionError("Conexao encerrada antes de receber todos os dados.")
+            raise ConnectionError("A conexao foi encerrada antes do recebimento completo.")
         chunks.append(chunk)
         received += len(chunk)
 
@@ -80,241 +81,284 @@ def recv_pickle(sock: socket.socket) -> Any:
     return pickle.loads(payload)
 
 
-def parse_matrix_sizes(size: int | None, sizes: str) -> list[int]:
-    """Interpreta --size ou --sizes e devolve uma lista de tamanhos."""
-    if size is not None:
-        if size <= 0:
-            raise ValueError("--size deve ser maior que zero.")
-        return [size]
-
-    parsed_sizes = [int(item.strip()) for item in sizes.split(",") if item.strip()]
-    if not parsed_sizes or any(matrix_size <= 0 for matrix_size in parsed_sizes):
-        raise ValueError("--sizes deve conter inteiros positivos separados por virgula.")
-    return parsed_sizes
-
-
-def parse_server_list(server_list: str | None, host: str, start_port: int, num_servers: int) -> list[ServerSpec]:
-    """Monta a lista de servidores a partir de --server-list ou portas sequenciais."""
-    if server_list:
-        servers: list[ServerSpec] = []
-        for raw_item in server_list.split(","):
-            item = raw_item.strip()
-            if not item:
-                continue
-
-            if ":" not in item:
-                raise ValueError("Cada servidor em --server-list deve estar no formato host:porta.")
-
-            server_host, raw_port = item.rsplit(":", 1)
-            servers.append(ServerSpec(server_host.strip(), int(raw_port)))
-
-        if not servers:
-            raise ValueError("--server-list nao pode estar vazio.")
-        return servers
-
-    if num_servers < 1:
-        raise ValueError("--servers deve ser maior ou igual a 1.")
-
-    return [ServerSpec(host, start_port + index) for index in range(num_servers)]
-
-
-def generate_random_matrices(matrix_size: int, low: int, high: int, seed: int | None) -> tuple[np.ndarray, np.ndarray]:
-    """Gera A e B aleatorias usando NumPy."""
-    rng = np.random.default_rng(seed)
-    matrix_a = rng.integers(low, high + 1, size=(matrix_size, matrix_size), dtype=np.int64)
-    matrix_b = rng.integers(low, high + 1, size=(matrix_size, matrix_size), dtype=np.int64)
+def generate_random_matrices(matrix_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Gera matrizes aleatorias A e B usando np.random.randint."""
+    matrix_a = np.random.randint(
+        VALUE_RANGE[0],
+        VALUE_RANGE[1],
+        size=(matrix_size, matrix_size),
+        dtype=DTYPE,
+    )
+    matrix_b = np.random.randint(
+        VALUE_RANGE[0],
+        VALUE_RANGE[1],
+        size=(matrix_size, matrix_size),
+        dtype=DTYPE,
+    )
     return matrix_a, matrix_b
 
 
-def split_matrix(matrix_a: np.ndarray, num_parts: int) -> list[np.ndarray]:
-    """Divide A verticalmente em num_parts submatrizes com tamanhos equilibrados."""
-    if num_parts > matrix_a.shape[0]:
-        raise ValueError("O numero de servidores nao pode ser maior que o numero de linhas de A.")
-    return list(np.array_split(matrix_a, num_parts, axis=0))
+def should_print_full_matrix(matrix_size: int) -> bool:
+    """Define se a matriz deve ser impressa completa ou resumida."""
+    return matrix_size in (20, 50)
+
+
+def matrix_to_display_text(matrix: np.ndarray, matrix_size: int) -> str:
+    """Formata matriz completa ou apenas as primeiras 5 linhas e colunas."""
+    if should_print_full_matrix(matrix_size):
+        return str(matrix)
+
+    preview = matrix[:5, :5]
+    return f"{preview}\n... (mostrando apenas as primeiras 5 linhas e 5 colunas)"
+
+
+def print_matrix(title: str, matrix: np.ndarray, matrix_size: int) -> None:
+    """Imprime uma matriz seguindo a regra de exibicao do trabalho."""
+    print(title)
+    print(matrix_to_display_text(matrix, matrix_size))
+    print()
+
+
+def split_matrix(matrix_a: np.ndarray, num_servers: int) -> list[np.ndarray]:
+    """Divide a matriz A em blocos verticais, um para cada servidor."""
+    if num_servers < 1:
+        raise ValueError("A quantidade de servidores deve ser maior ou igual a 1.")
+    if num_servers > matrix_a.shape[0]:
+        raise ValueError("A quantidade de servidores nao pode ser maior que o numero de linhas da matriz.")
+    return list(np.array_split(matrix_a, num_servers, axis=0))
 
 
 def multiply_serial(matrix_a: np.ndarray, matrix_b: np.ndarray) -> tuple[np.ndarray, float]:
-    """Executa C = A x B localmente e mede o tempo em milissegundos."""
-    started_at = time.perf_counter()
-    result = matrix_a @ matrix_b
-    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    """Multiplica localmente com NumPy e mede o tempo em milissegundos."""
+    start = time.perf_counter()
+    result = np.dot(matrix_a, matrix_b)
+    elapsed_ms = (time.perf_counter() - start) * 1000
     return result, elapsed_ms
 
 
-def request_partial_result(
-    index: int,
-    server: ServerSpec,
+def request_server_multiplication(
+    server_index: int,
+    server_address: tuple[str, int],
     submatrix_a: np.ndarray,
     matrix_b: np.ndarray,
-    timeout: float,
-) -> tuple[int, np.ndarray, float]:
-    """Envia uma submatriz para um servidor e recebe o resultado parcial."""
-    task_id = f"parte-{index + 1}"
+    results: list[np.ndarray | None],
+    server_times_ms: list[float],
+    errors: list[Exception],
+) -> None:
+    """Thread do cliente: envia uma submatriz a um servidor e guarda a resposta."""
+    host, port = server_address
 
-    with socket.create_connection((server.host, server.port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        send_pickle(
-            sock,
-            {
-                "action": "multiply",
-                "task_id": task_id,
-                "submatrix_a": submatrix_a,
-                "matrix_b": matrix_b,
-            },
-        )
-        response = recv_pickle(sock)
+    try:
+        with socket.create_connection((host, port), timeout=SOCKET_TIMEOUT_SECONDS) as sock:
+            sock.settimeout(SOCKET_TIMEOUT_SECONDS)
+            send_pickle(
+                sock,
+                {
+                    "action": "multiply",
+                    "server_index": server_index,
+                    "submatrix_a": submatrix_a,
+                    "matrix_b": matrix_b,
+                },
+            )
+            response = recv_pickle(sock)
 
-    if response.get("status") != "ok":
-        message = response.get("message", "erro desconhecido")
-        raise RuntimeError(f"Servidor {server.label} falhou: {message}")
+        if response.get("status") != "ok":
+            raise RuntimeError(response.get("message", "Erro desconhecido no servidor."))
 
-    return index, response["result"], float(response.get("server_time_ms", 0.0))
+        results[server_index] = response["result"]
+        server_times_ms[server_index] = float(response["elapsed_ms"])
+
+    except Exception as exc:
+        errors.append(exc)
 
 
 def multiply_distributed(
     matrix_a: np.ndarray,
     matrix_b: np.ndarray,
-    servers: list[ServerSpec],
-    timeout: float,
-) -> tuple[np.ndarray, float, list[float]]:
-    """Executa a multiplicacao distribuida e aguarda todos os servidores."""
+    servers: list[tuple[str, int]],
+) -> tuple[np.ndarray, float, list[np.ndarray], list[float]]:
+    """Executa a multiplicacao distribuida usando uma thread por servidor."""
     submatrices = split_matrix(matrix_a, len(servers))
-    results: list[np.ndarray | None] = [None] * len(servers)
+    row_counts = [submatrix.shape[0] for submatrix in submatrices]
+    row_summary = ", ".join(str(row_count) for row_count in row_counts)
+    print(
+        f"[CLIENTE] Dividindo A em {len(servers)} submatrizes "
+        f"(linhas por servidor: {row_summary})...\n"
+    )
+
+    partial_results: list[np.ndarray | None] = [None] * len(servers)
     server_times_ms = [0.0] * len(servers)
+    errors: list[Exception] = []
+    threads: list[threading.Thread] = []
 
-    started_at = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=len(servers)) as executor:
-        futures = []
-        for index, (server, submatrix) in enumerate(zip(servers, submatrices)):
-            print(
-                f"[CLIENT] Enviando submatriz {index + 1}/{len(servers)} "
-                f"{submatrix.shape} para Servidor {index + 1} ({server.label})..."
-            )
-            futures.append(executor.submit(request_partial_result, index, server, submatrix, matrix_b, timeout))
+    start = time.perf_counter()
+    for index, (server, submatrix) in enumerate(zip(servers, submatrices)):
+        print(f"[CLIENTE] Enviando submatriz para Servidor {index + 1} ({server[0]}:{server[1]})...")
+        thread = threading.Thread(
+            target=request_server_multiplication,
+            args=(index, server, submatrix, matrix_b, partial_results, server_times_ms, errors),
+            daemon=False,
+        )
+        threads.append(thread)
+        thread.start()
 
-        for future in as_completed(futures):
-            index, partial_result, server_time_ms = future.result()
-            results[index] = partial_result
-            server_times_ms[index] = server_time_ms
-            print(f"[CLIENT] Resultado parcial {index + 1} recebido.")
+    for thread in threads:
+        thread.join()
 
-    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    elapsed_ms = (time.perf_counter() - start) * 1000
 
-    if any(result is None for result in results):
-        raise RuntimeError("Nem todos os servidores retornaram resultado.")
+    if errors:
+        raise RuntimeError(f"Erro durante a execucao distribuida: {errors[0]}")
 
-    final_result = np.vstack([result for result in results if result is not None])
-    return final_result, elapsed_ms, server_times_ms
+    if any(result is None for result in partial_results):
+        raise RuntimeError("Nem todos os servidores retornaram resultados parciais.")
+
+    typed_results = [result for result in partial_results if result is not None]
+    final_matrix = np.vstack(typed_results)
+    return final_matrix, elapsed_ms, typed_results, server_times_ms
 
 
-def append_benchmark_result(csv_path: Path, row: dict[str, Any]) -> None:
-    """Salva uma linha de benchmark no CSV, criando cabecalho quando necessario."""
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+def append_benchmark_row(row: dict[str, Any]) -> None:
+    """Acrescenta uma linha ao CSV sem apagar historico anterior."""
+    file_exists = CSV_PATH.exists() and CSV_PATH.stat().st_size > 0
 
-    with csv_path.open("a", newline="", encoding="utf-8") as csv_file:
+    with CSV_PATH.open("a", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
 
 
-def run_benchmark_for_size(
-    matrix_size: int,
-    servers: list[ServerSpec],
-    args: argparse.Namespace,
-    seed: int | None,
-) -> dict[str, Any]:
-    """Executa benchmark serial e distribuido para um tamanho de matriz."""
-    print(f"\n[CLIENT] Gerando matrizes A ({matrix_size}x{matrix_size}) e B ({matrix_size}x{matrix_size})...")
-    matrix_a, matrix_b = generate_random_matrices(matrix_size, args.low, args.high, seed)
+def save_last_run_matrices(last_run: dict[str, Any]) -> None:
+    """Salva A, B e C da ultima execucao em JSON para uso no notebook."""
+    with LAST_RUN_JSON_PATH.open("w", encoding="utf-8") as json_file:
+        json.dump(last_run, json_file, ensure_ascii=False, indent=2)
 
-    if args.print_matrices and matrix_size <= 10:
-        print("[CLIENT] Matriz A:")
-        print(matrix_a)
-        print("[CLIENT] Matriz B:")
-        print(matrix_b)
+
+def run_test(matrix_size: int, servers: list[tuple[str, int]], last_run: dict[str, Any]) -> None:
+    """Executa o teste completo para um tamanho de matriz."""
+    print(SEPARATOR)
+    print(f" TESTE: Matriz {matrix_size}x{matrix_size}")
+    print(SEPARATOR)
+    print()
+
+    matrix_a, matrix_b = generate_random_matrices(matrix_size)
+
+    print_matrix(f"[CLIENTE] Matriz A gerada ({matrix_size}x{matrix_size}):", matrix_a, matrix_size)
+    print_matrix(f"[CLIENTE] Matriz B gerada ({matrix_size}x{matrix_size}):", matrix_b, matrix_size)
 
     serial_result, serial_time_ms = multiply_serial(matrix_a, matrix_b)
-    distributed_result, parallel_time_ms, server_times_ms = multiply_distributed(
+    distributed_result, parallel_time_ms, partial_results, server_times_ms = multiply_distributed(
         matrix_a,
         matrix_b,
         servers,
-        args.timeout,
     )
 
-    print("[CLIENT] Resultado recebido de todos os servidores.")
+    if not np.array_equal(serial_result, distributed_result):
+        raise AssertionError("Resultado distribuido diferente do resultado serial.")
 
-    if not args.skip_validation and not np.array_equal(distributed_result, serial_result):
-        raise AssertionError("A matriz distribuida nao corresponde ao resultado serial.")
+    for index, (partial_result, server_time_ms) in enumerate(zip(partial_results, server_times_ms), start=1):
+        print(
+            f"[SERVIDOR {index}] Recebeu submatriz A "
+            f"({partial_result.shape[0]}x{matrix_a.shape[1]}) e matriz B ({matrix_b.shape[0]}x{matrix_b.shape[1]})"
+        )
+        print(f"[SERVIDOR {index}] Multiplicando com threading... concluido em {server_time_ms:.0f}ms\n")
+        print_matrix(f"[CLIENTE] Resultado parcial do Servidor {index}:", partial_result, matrix_size)
+
+    print_matrix(
+        f"[CLIENTE] Matriz C final ({matrix_size}x{matrix_size}) montada com sucesso:",
+        distributed_result,
+        matrix_size,
+    )
 
     speedup = serial_time_ms / parallel_time_ms if parallel_time_ms > 0 else 0.0
     row = {
         "matrix_size": matrix_size,
-        "serial_time_ms": round(serial_time_ms, 4),
-        "parallel_time_ms": round(parallel_time_ms, 4),
-        "speedup": round(speedup, 4),
+        "serial_time_ms": round(serial_time_ms, 2),
+        "parallel_time_ms": round(parallel_time_ms, 2),
+        "speedup": round(speedup, 2),
         "num_servers": len(servers),
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    append_benchmark_row(row)
+
+    last_run[str(matrix_size)] = {
+        "matrix_size": matrix_size,
+        "A": matrix_a.tolist(),
+        "B": matrix_b.tolist(),
+        "partial_results": [
+            {
+                "server": index,
+                "rows": partial_result.shape[0],
+                "cols": partial_result.shape[1],
+                "matrix": partial_result.tolist(),
+            }
+            for index, partial_result in enumerate(partial_results, start=1)
+        ],
+        "C": distributed_result.tolist(),
     }
 
-    append_benchmark_result(Path(args.output), row)
+    print(f"[CLIENTE] Tempo Serial:      {serial_time_ms:.0f} ms")
+    print(f"[CLIENTE] Tempo Distribuido: {parallel_time_ms:.0f} ms")
+    print(f"[CLIENTE] Speedup:           {speedup:.2f}x")
+    print(SEPARATOR)
+    print()
 
-    print("[CLIENT] Matriz resultante C montada com sucesso!")
-    print(
-        f"[CLIENT] Tempo Serial: {serial_time_ms:.2f}ms | "
-        f"Tempo Distribuido: {parallel_time_ms:.2f}ms | Speedup: {speedup:.2f}x"
-    )
-    print(
-        "[CLIENT] Tempos internos dos servidores: "
-        + ", ".join(f"{time_ms:.2f}ms" for time_ms in server_times_ms)
-    )
-    print(f"[CLIENT] Resultados salvos em {args.output}")
 
-    return row
+def build_servers(num_servers: int, start_port: int, host: str) -> list[tuple[str, int]]:
+    """Monta a lista de servidores em portas sequenciais."""
+    if num_servers < 1:
+        raise ValueError("--servers deve ser maior ou igual a 1.")
+    return [(host, start_port + index) for index in range(num_servers)]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cliente para multiplicacao de matrizes distribuida.")
-    parser.add_argument("--size", type=int, default=None, help="Executa apenas um tamanho n para matrizes n x n.")
+    """Le os parametros usados para escolher quantos servidores participam."""
+    parser = argparse.ArgumentParser(description="Cliente do PROJETOCP.")
     parser.add_argument(
-        "--sizes",
-        default=DEFAULT_SIZES,
-        help=f"Tamanhos separados por virgula para benchmark. Padrao: {DEFAULT_SIZES}.",
+        "--servers",
+        type=int,
+        default=DEFAULT_NUM_SERVERS,
+        help="Quantidade de servidores/portas que voce abriu. Ex: --servers 4",
     )
-    parser.add_argument("--servers", type=int, default=2, help="Numero de servidores usando portas sequenciais.")
-    parser.add_argument("--server-host", default=DEFAULT_HOST, help=f"Host dos servidores. Padrao: {DEFAULT_HOST}.")
     parser.add_argument(
         "--start-port",
         type=int,
         default=DEFAULT_START_PORT,
-        help=f"Primeira porta dos servidores sequenciais. Padrao: {DEFAULT_START_PORT}.",
+        help="Primeira porta dos servidores. Ex: 5000 gera 5000, 5001, 5002...",
     )
     parser.add_argument(
-        "--server-list",
-        default=None,
-        help="Lista customizada no formato host:porta,host:porta. Ex: 127.0.0.1:5000,127.0.0.1:5001",
+        "--host",
+        default=DEFAULT_SERVER_HOST,
+        help="Host onde os servidores estao rodando.",
     )
-    parser.add_argument("--low", type=int, default=-10, help="Menor valor aleatorio das matrizes.")
-    parser.add_argument("--high", type=int, default=10, help="Maior valor aleatorio das matrizes.")
-    parser.add_argument("--seed", type=int, default=42, help="Semente para reprodutibilidade. Use vazio removendo o valor.")
-    parser.add_argument("--timeout", type=float, default=120.0, help="Timeout em segundos para cada conexao.")
-    parser.add_argument("--output", default="benchmark_results.csv", help="Arquivo CSV de saida.")
-    parser.add_argument("--print-matrices", action="store_true", help="Mostra matrizes quando n <= 10.")
-    parser.add_argument("--skip-validation", action="store_true", help="Nao compara o resultado distribuido com o serial.")
     return parser.parse_args()
 
 
 def main() -> None:
+    """Executa automaticamente os quatro tamanhos obrigatorios."""
     args = parse_args()
-    sizes = parse_matrix_sizes(args.size, args.sizes)
-    servers = parse_server_list(args.server_list, args.server_host, args.start_port, args.servers)
+    servers = build_servers(args.servers, args.start_port, args.host)
 
-    print("[CLIENT] Servidores configurados: " + ", ".join(server.label for server in servers))
+    np.set_printoptions(linewidth=120)
 
-    for run_index, matrix_size in enumerate(sizes):
-        seed = None if args.seed is None else args.seed + run_index
-        run_benchmark_for_size(matrix_size, servers, args, seed)
+    print("[CLIENTE] Servidores configurados:")
+    for index, (host, port) in enumerate(servers, start=1):
+        print(f"  Servidor {index}: {host}:{port}")
+    print()
+
+    last_run: dict[str, Any] = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "servers": [f"{host}:{port}" for host, port in servers],
+        "matrices": {},
+    }
+
+    for matrix_size in MATRIX_SIZES:
+        run_test(matrix_size, servers, last_run["matrices"])
+
+    save_last_run_matrices(last_run)
+    print(f"[CLIENTE] Resultados acrescentados em {CSV_PATH}")
+    print(f"[CLIENTE] Matrizes da ultima execucao salvas em {LAST_RUN_JSON_PATH}")
 
 
 if __name__ == "__main__":

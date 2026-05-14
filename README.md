@@ -44,7 +44,7 @@ pip install -r requirements.txt
 
 ## Executando os servidores
 
-Abra um terminal para cada servidor. Exemplo com 2 servidores locais:
+Abra um terminal para cada servidor. Exemplo com 4 servidores locais:
 
 ```bash
 python Server.py 5000
@@ -56,10 +56,16 @@ Em outro terminal:
 python Server.py 5001
 ```
 
-Também é possível configurar host, porta e número de threads internas:
+Em outro terminal:
 
 ```bash
-python Server.py --host 127.0.0.1 --port 5000 --workers 4
+python Server.py 5002
+```
+
+Em outro terminal:
+
+```bash
+python Server.py 5003
 ```
 
 O servidor permanece aguardando conexões até ser encerrado com `Ctrl+C`.
@@ -69,49 +75,45 @@ O servidor permanece aguardando conexões até ser encerrado com `Ctrl+C`.
 Com os servidores ativos, execute:
 
 ```bash
-python Client.py
+python Client.py --servers 4 --start-port 5000
 ```
 
-Por padrão, o cliente usa 2 servidores nas portas `5000` e `5001` e testa os
-tamanhos `20`, `100`, `500` e `1000`.
+O comando acima usa os 4 servidores nas portas `5000`, `5001`, `5002` e `5003`.
+O cliente testa automaticamente os tamanhos `20`, `50`, `100` e `200`.
 
-Para executar apenas um tamanho:
-
-```bash
-python Client.py --size 100 --servers 2 --start-port 5000
-```
-
-Para informar servidores manualmente:
+Se você abrir apenas 2 servidores, execute:
 
 ```bash
-python Client.py --size 100 --server-list 127.0.0.1:5000,127.0.0.1:5001
+python Client.py --servers 2 --start-port 5000
 ```
 
 Principais opções do cliente:
 
-- `--size`: executa um único tamanho `n` para matrizes `n x n`.
-- `--sizes`: lista de tamanhos separados por vírgula, por exemplo `20,100,500,1000`.
 - `--servers`: quantidade de servidores em portas sequenciais.
 - `--start-port`: primeira porta usada quando `--servers` é informado.
-- `--server-list`: lista explícita no formato `host:porta,host:porta`.
-- `--output`: arquivo CSV de saída.
-- `--print-matrices`: imprime as matrizes quando `n <= 10`.
+- `--host`: host onde os servidores estão rodando.
 
 ## Resultado esperado
 
 Exemplo de saída:
 
 ```text
-[CLIENT] Servidores configurados: 127.0.0.1:5000, 127.0.0.1:5001
-[CLIENT] Gerando matrizes A (100x100) e B (100x100)...
-[CLIENT] Enviando submatriz 1/2 (50, 100) para Servidor 1 (127.0.0.1:5000)...
-[CLIENT] Enviando submatriz 2/2 (50, 100) para Servidor 2 (127.0.0.1:5001)...
-[CLIENT] Resultado parcial 1 recebido.
-[CLIENT] Resultado parcial 2 recebido.
-[CLIENT] Resultado recebido de todos os servidores.
-[CLIENT] Matriz resultante C montada com sucesso!
-[CLIENT] Tempo Serial: 180.00ms | Tempo Distribuido: 95.00ms | Speedup: 1.89x
-[CLIENT] Resultados salvos em benchmark_results.csv
+[CLIENTE] Servidores configurados:
+  Servidor 1: localhost:5000
+  Servidor 2: localhost:5001
+  Servidor 3: localhost:5002
+  Servidor 4: localhost:5003
+
+============================================================
+ TESTE: Matriz 20x20
+============================================================
+
+[CLIENTE] Matriz A gerada (20x20):
+...
+[CLIENTE] Dividindo A em 4 submatrizes (linhas por servidor: 5, 5, 5, 5)...
+[CLIENTE] Tempo Serial:      1 ms
+[CLIENTE] Tempo Distribuido: 8 ms
+[CLIENTE] Speedup:           0.12x
 ```
 
 ## CSV de benchmark
