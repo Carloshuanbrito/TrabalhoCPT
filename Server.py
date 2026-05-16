@@ -18,7 +18,7 @@ import struct
 import threading
 import time
 from typing import Any
-
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 
@@ -72,8 +72,16 @@ def handle_client(conn: socket.socket, addr: tuple[str, int], port: int) -> None
 
             print(f"[SERVIDOR porta={port}] Submatriz recebida: shape={submatrix_a.shape}")
 
+            def multiply_row(row, matrix_b):
+                return np.dot(row, matrix_b)
+            
             start = time.perf_counter()
-            result = np.dot(submatrix_a, matrix_b)
+
+            with ThreadPoolExecutor() as executor:
+                rows = list(executor.map(lambda row: multiply_row(row, matrix_b), submatrix_a))
+            
+            result = np.array(rows)
+           
             elapsed_ms = (time.perf_counter() - start) * 1000
 
             print(
