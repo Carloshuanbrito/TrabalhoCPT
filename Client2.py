@@ -34,7 +34,16 @@ DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_START_PORT = 5000
 DEFAULT_NUM_SERVERS = 2
 
-MATRIX_SIZES = [20, 50, 100, 200, 500, 1000]
+MATRIX_CONFIGS = [
+    (20, 10, 30),
+    (50, 25, 60),
+    (100, 50, 120),
+    (200, 100, 250),
+    (1000, 2000, 1000),
+    (2000, 3000, 2000),
+    (10000, 20000, 10000),
+    (20000, 30000, 20000),
+]
 
 DTYPE = np.int32
 VALUE_RANGE = (1, 10)
@@ -94,26 +103,28 @@ def recv_pickle(sock: socket.socket) -> Any:
 
 
 def generate_random_matrices(
-    matrix_size: int,
+    rows_a: int,
+    cols_a: int,
+    cols_b: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Gera:
 
-    A = matrix_size x matrix_size
-    B = matrix_size x matrix_size
+    A = rows_a x cols_a
+    B = cols_a x cols_b
     """
 
     matrix_a = np.random.randint(
         VALUE_RANGE[0],
         VALUE_RANGE[1],
-        size=(matrix_size, matrix_size),
+        size=(rows_a, cols_a),
         dtype=DTYPE,
     )
 
     matrix_b = np.random.randint(
         VALUE_RANGE[0],
         VALUE_RANGE[1],
-        size=(matrix_size, matrix_size),
+        size=(cols_a, cols_b),
         dtype=DTYPE,
     )
 
@@ -357,31 +368,35 @@ def save_last_run_matrices(last_run: dict[str, Any]) -> None:
 
 
 def run_test(
-    matrix_size: int,
+    matrix_config: tuple[int, int, int],
     servers: list[tuple[str, int]],
     last_run: dict[str, Any],
 ) -> None:
 
+    rows_a, cols_a, cols_b = matrix_config
+
     print(SEPARATOR)
 
     print(
-        f" TESTE: Matriz {matrix_size}x{matrix_size}"
+        f" TESTE: Matriz A({rows_a}x{cols_a}) x B({cols_a}x{cols_b})"
     )
 
     print(SEPARATOR)
     print()
 
     matrix_a, matrix_b = generate_random_matrices(
-        matrix_size,
+        rows_a,
+        cols_a,
+        cols_b,
     )
 
     print_matrix(
-        f"[CLIENTE] Matriz A gerada ({matrix_size}x{matrix_size}):",
+        f"[CLIENTE] Matriz A gerada ({rows_a}x{cols_a}):",
         matrix_a,
     )
 
     print_matrix(
-        f"[CLIENTE] Matriz B gerada ({matrix_size}x{matrix_size}):",
+        f"[CLIENTE] Matriz B gerada ({cols_a}x{cols_b}):",
         matrix_b,
     )
 
@@ -432,7 +447,7 @@ def run_test(
 
     print_matrix(
         f"[CLIENTE] Matriz C final "
-        f"({matrix_size}x{matrix_size}) montada com sucesso:",
+        f"({rows_a}x{cols_b}) montada com sucesso:",
         distributed_result,
     )
 
@@ -442,8 +457,10 @@ def run_test(
         else 0.0
     )
 
+    config_str = f"{rows_a}x{cols_a}x{cols_b}"
+
     row = {
-        "matrix_size": matrix_size,
+        "matrix_size": config_str,
         "serial_time_ms": round(serial_time_ms, 2),
         "parallel_time_ms": round(parallel_time_ms, 2),
         "speedup": round(speedup, 2),
@@ -453,10 +470,11 @@ def run_test(
 
     append_benchmark_row(row)
 
-    matrix_key = f"{matrix_size}x{matrix_size}"
-
-    last_run[matrix_key] = {
-        "matrix_size": matrix_size,
+    last_run[config_str] = {
+        "matrix_config": matrix_config,
+        "rows_a": rows_a,
+        "cols_a": cols_a,
+        "cols_b": cols_b,
         "A": matrix_a.tolist(),
         "B": matrix_b.tolist(),
         "partial_results": [
@@ -486,7 +504,7 @@ def run_test(
         outcome = "Distribuido vence"
 
     print(
-        f"[{matrix_size}x{matrix_size}]".ljust(12)
+        f"[{config_str}]".ljust(20)
         + f" Serial: {serial_time_ms:.0f}ms".ljust(18)
         + f"| Distribuido: {parallel_time_ms:.0f}ms".ljust(25)
         + f"| Speedup: {speedup:.2f}x <- {outcome}"
@@ -600,10 +618,10 @@ def main() -> None:
         "matrices": {},
     }
 
-    for matrix_size in MATRIX_SIZES:
+    for matrix_config in MATRIX_CONFIGS:
 
         run_test(
-            matrix_size,
+            matrix_config,
             servers,
             last_run["matrices"],
         )
