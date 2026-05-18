@@ -30,32 +30,20 @@ import numpy as np
 
 
 # Configuracoes obrigatorias do trabalho
-DEFAULT_SERVER_HOST = "localhost"
+DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_START_PORT = 5000
 DEFAULT_NUM_SERVERS = 2
 
-# (rows_a, cols_a (tbm row_b), cols_b)
-MATRIX_CONFIGS = [
-    (20, 10, 30),
-    (50, 25, 60),
-    (100, 50, 120),
-    (200, 100, 250),
-    (1000, 2000, 1000),
-    (2000, 3000, 2000),
-    (10000, 20000, 10000),
-    (20000, 30000, 20000),
-]
+MATRIX_SIZES = [20, 50, 100, 200, 500, 1000]
 
-DTYPE = np.int16
+DTYPE = np.int32
 VALUE_RANGE = (1, 10)
 
 CSV_PATH = Path("benchmark_results.csv")
 LAST_RUN_JSON_PATH = Path("last_run_matrices.json")
 
 CSV_COLUMNS = [
-    "rows_a",
-    "cols_a",
-    "cols_b",
+    "matrix_size",
     "serial_time_ms",
     "parallel_time_ms",
     "speedup",
@@ -65,14 +53,18 @@ CSV_COLUMNS = [
 
 HEADER_FORMAT = "!Q"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-SOCKET_TIMEOUT_SECONDS = 120
+SOCKET_TIMEOUT_SECONDS = 300
+SOCKET_CHUNK_SIZE = 1024 * 1024
+SERVER_REQUEST_RETRIES = 2
 SEPARATOR = "=" * 60
 
 
 def send_pickle(sock: socket.socket, obj: Any) -> None:
     payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     sock.sendall(struct.pack(HEADER_FORMAT, len(payload)))
-    sock.sendall(payload)
+
+    for offset in range(0, len(payload), SOCKET_CHUNK_SIZE):
+        sock.sendall(payload[offset : offset + SOCKET_CHUNK_SIZE])
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -80,7 +72,8 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     received = 0
 
     while received < size:
-        chunk = sock.recv(size - received)
+        chunk_size = min(SOCKET_CHUNK_SIZE, size - received)
+        chunk = sock.recv(chunk_size)
 
         if not chunk:
             raise ConnectionError(
@@ -101,28 +94,26 @@ def recv_pickle(sock: socket.socket) -> Any:
 
 
 def generate_random_matrices(
-    rows_a: int,
-    cols_a: int,
-    cols_b: int,
+    matrix_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Gera:
 
-    A = rows_a x cols_a
-    B = cols_a x cols_b
+    A = matrix_size x matrix_size
+    B = matrix_size x matrix_size
     """
 
     matrix_a = np.random.randint(
         VALUE_RANGE[0],
         VALUE_RANGE[1],
-        size=(rows_a, cols_a),
+        size=(matrix_size, matrix_size),
         dtype=DTYPE,
     )
 
     matrix_b = np.random.randint(
         VALUE_RANGE[0],
         VALUE_RANGE[1],
-        size=(cols_a, cols_b),
+        size=(matrix_size, matrix_size),
         dtype=DTYPE,
     )
 
@@ -197,39 +188,57 @@ def request_server_multiplication(
 
     host, port = server_address
 
-    try:
-        with socket.create_connection(
-            (host, port),
-            timeout=SOCKET_TIMEOUT_SECONDS,
-        ) as sock:
+    for attempt in range(1, SERVER_REQUEST_RETRIES + 1):
+        try:
+            with socket.create_connection(
+                (host, port),
+                timeout=SOCKET_TIMEOUT_SECONDS,
+            ) as sock:
 
-            sock.settimeout(SOCKET_TIMEOUT_SECONDS)
+                sock.settimeout(SOCKET_TIMEOUT_SECONDS)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-            send_pickle(
-                sock,
-                {
-                    "action": "multiply",
-                    "server_index": server_index,
-                    "submatrix_a": submatrix_a,
-                    "matrix_b": matrix_b,
-                },
-            )
+                send_pickle(
+                    sock,
+                    {
+                        "action": "multiply",
+                        "server_index": server_index,
+                        "submatrix_a": submatrix_a,
+                        "matrix_b": matrix_b,
+                    },
+                )
 
-            response = recv_pickle(sock)
+                response = recv_pickle(sock)
 
-        if response.get("status") != "ok":
-            raise RuntimeError(
-                response.get(
-                    "message",
-                    "Erro desconhecido no servidor.",
+            if response.get("status") != "ok":
+                raise RuntimeError(
+                    response.get(
+                        "message",
+                        "Erro desconhecido no servidor.",
+                    )
+                )
+
+            results[server_index] = response["result"]
+            server_times_ms[server_index] = float(response["elapsed_ms"])
+            return
+
+        except Exception as exc:
+            if attempt < SERVER_REQUEST_RETRIES:
+                print(
+                    f"[CLIENTE] Servidor {server_index + 1} ({host}:{port}) "
+                    f"falhou na tentativa {attempt}; tentando novamente..."
+                )
+                time.sleep(1)
+                continue
+
+            errors.append(
+                RuntimeError(
+                    f"Servidor {server_index + 1} ({host}:{port}) falhou "
+                    f"apos {SERVER_REQUEST_RETRIES} tentativa(s), "
+                    f"com submatriz {submatrix_a.shape} e B {matrix_b.shape}: {exc}"
                 )
             )
-
-        results[server_index] = response["result"]
-        server_times_ms[server_index] = float(response["elapsed_ms"])
-
-    except Exception as exc:
-        errors.append(exc)
+            return
 
 
 def multiply_distributed(
@@ -348,9 +357,7 @@ def save_last_run_matrices(last_run: dict[str, Any]) -> None:
 
 
 def run_test(
-    rows_a: int,
-    cols_a: int,
-    cols_b: int,
+    matrix_size: int,
     servers: list[tuple[str, int]],
     last_run: dict[str, Any],
 ) -> None:
@@ -358,26 +365,23 @@ def run_test(
     print(SEPARATOR)
 
     print(
-        f" TESTE: A({rows_a}x{cols_a}) x "
-        f"B({cols_a}x{cols_b})"
+        f" TESTE: Matriz {matrix_size}x{matrix_size}"
     )
 
     print(SEPARATOR)
     print()
 
     matrix_a, matrix_b = generate_random_matrices(
-        rows_a,
-        cols_a,
-        cols_b,
+        matrix_size,
     )
 
     print_matrix(
-        f"[CLIENTE] Matriz A gerada ({rows_a}x{cols_a}):",
+        f"[CLIENTE] Matriz A gerada ({matrix_size}x{matrix_size}):",
         matrix_a,
     )
 
     print_matrix(
-        f"[CLIENTE] Matriz B gerada ({cols_a}x{cols_b}):",
+        f"[CLIENTE] Matriz B gerada ({matrix_size}x{matrix_size}):",
         matrix_b,
     )
 
@@ -428,7 +432,7 @@ def run_test(
 
     print_matrix(
         f"[CLIENTE] Matriz C final "
-        f"({rows_a}x{cols_b}) montada com sucesso:",
+        f"({matrix_size}x{matrix_size}) montada com sucesso:",
         distributed_result,
     )
 
@@ -439,9 +443,7 @@ def run_test(
     )
 
     row = {
-        "rows_a": rows_a,
-        "cols_a": cols_a,
-        "cols_b": cols_b,
+        "matrix_size": matrix_size,
         "serial_time_ms": round(serial_time_ms, 2),
         "parallel_time_ms": round(parallel_time_ms, 2),
         "speedup": round(speedup, 2),
@@ -451,12 +453,10 @@ def run_test(
 
     append_benchmark_row(row)
 
-    matrix_key = f"{rows_a}x{cols_a}_x_{cols_a}x{cols_b}"
+    matrix_key = f"{matrix_size}x{matrix_size}"
 
     last_run[matrix_key] = {
-        "rows_a": rows_a,
-        "cols_a": cols_a,
-        "cols_b": cols_b,
+        "matrix_size": matrix_size,
         "A": matrix_a.tolist(),
         "B": matrix_b.tolist(),
         "partial_results": [
@@ -478,6 +478,20 @@ def run_test(
     print(f"[CLIENTE] Tempo Distribuido: {parallel_time_ms:.0f} ms")
     print(f"[CLIENTE] Speedup:           {speedup:.2f}x")
 
+    if speedup < 1.0:
+        outcome = "Serial vence"
+    elif speedup < 1.2:
+        outcome = "Transicao"
+    else:
+        outcome = "Distribuido vence"
+
+    print(
+        f"[{matrix_size}x{matrix_size}]".ljust(12)
+        + f" Serial: {serial_time_ms:.0f}ms".ljust(18)
+        + f"| Distribuido: {parallel_time_ms:.0f}ms".ljust(25)
+        + f"| Speedup: {speedup:.2f}x <- {outcome}"
+    )
+
     print(SEPARATOR)
     print()
 
@@ -497,6 +511,35 @@ def build_servers(
         (host, start_port + index)
         for index in range(num_servers)
     ]
+
+
+def verify_servers(servers: list[tuple[str, int]]) -> None:
+    """Confirma se todos os servidores configurados respondem antes do benchmark."""
+    print("[CLIENTE] Verificando conexao com os servidores...")
+
+    for index, (host, port) in enumerate(servers, start=1):
+        try:
+            with socket.create_connection(
+                (host, port),
+                timeout=10,
+            ) as sock:
+                sock.settimeout(10)
+                send_pickle(sock, {"action": "ping"})
+                response = recv_pickle(sock)
+
+            if response.get("status") != "ok":
+                raise RuntimeError(response)
+
+            print(f"  Servidor {index}: {host}:{port} OK")
+
+        except Exception as exc:
+            raise RuntimeError(
+                f"Servidor {index} ({host}:{port}) nao respondeu ao ping. "
+                "Feche os servidores antigos e abra novamente com o Server.py atualizado. "
+                f"Detalhe: {exc}"
+            ) from exc
+
+    print()
 
 
 def parse_args() -> argparse.Namespace:
@@ -546,6 +589,7 @@ def main() -> None:
         print(f"  Servidor {index}: {host}:{port}")
 
     print()
+    verify_servers(servers)
 
     last_run: dict[str, Any] = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -556,12 +600,10 @@ def main() -> None:
         "matrices": {},
     }
 
-    for rows_a, cols_a, cols_b in MATRIX_CONFIGS:
+    for matrix_size in MATRIX_SIZES:
 
         run_test(
-            rows_a,
-            cols_a,
-            cols_b,
+            matrix_size,
             servers,
             last_run["matrices"],
         )
