@@ -1,5 +1,3 @@
-# Client.py COMPLETO adaptado para matrizes não quadradas
-
 
 """
 Cliente do PROJETOCP - multiplicacao de matrizes distribuida.
@@ -29,21 +27,9 @@ from typing import Any
 import numpy as np
 
 
-# Configuracoes obrigatorias do trabalho
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_START_PORT = 5000
-DEFAULT_NUM_SERVERS = 2
-
-MATRIX_CONFIGS = [
-    (20, 10, 30),
-    (50, 25, 60),
-    (100, 50, 120),
-    (200, 100, 250),
-    (1000, 2000, 1000),
-    (2000, 3000, 2000),
-    (10000, 20000, 10000),
-    (20000, 30000, 20000),
-]
+DEFAULT_NUM_SERVERS = 4
 
 DTYPE = np.int32
 VALUE_RANGE = (1, 10)
@@ -356,7 +342,26 @@ def append_benchmark_row(row: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
+def matrix_config_sort_key(config_key: str) -> tuple[int, int, int]:
+    """Retorna uma chave numerica para ordenar configuracoes NxMxP."""
+    parts = config_key.split("x")
+
+    if len(parts) != 3:
+        raise ValueError(f"Configuracao de matriz invalida: {config_key}")
+
+    return tuple(int(part) for part in parts)
+
+
 def save_last_run_matrices(last_run: dict[str, Any]) -> None:
+    matrices = last_run.get("matrices", {})
+
+    if isinstance(matrices, dict):
+        last_run["matrices"] = dict(
+            sorted(
+                matrices.items(),
+                key=lambda item: matrix_config_sort_key(item[0]),
+            )
+        )
 
     with LAST_RUN_JSON_PATH.open("w", encoding="utf-8") as json_file:
         json.dump(
@@ -560,6 +565,124 @@ def verify_servers(servers: list[tuple[str, int]]) -> None:
     print()
 
 
+def parse_matrix_config_text(config_text: str) -> tuple[int, int, int]:
+    """Converte uma entrada do usuario em (linhas_A, colunas_A, colunas_B).
+
+    Formatos aceitos:
+    - "100"        -> A(100x100) x B(100x100)
+    - "100,50,120" -> A(100x50) x B(50x120)
+    - "100x50x120" -> A(100x50) x B(50x120)
+    """
+    normalized = config_text.strip().lower().replace("x", ",")
+    parts = [part.strip() for part in normalized.split(",") if part.strip()]
+
+    if len(parts) == 1:
+        size = int(parts[0])
+        config = (size, size, size)
+    elif len(parts) == 3:
+        config = tuple(int(part) for part in parts)
+    else:
+        raise ValueError(
+            "Use um unico tamanho, como 100, ou tres valores, como 100,50,120."
+        )
+
+    rows_a, cols_a, cols_b = config
+
+    if rows_a <= 0 or cols_a <= 0 or cols_b <= 0:
+        raise ValueError("Todos os tamanhos devem ser maiores que zero.")
+
+    return rows_a, cols_a, cols_b
+
+
+def parse_matrix_configs(configs_text: str) -> list[tuple[int, int, int]]:
+    """Converte varias configuracoes separadas por ponto e virgula."""
+    raw_configs = [
+        item.strip()
+        for item in configs_text.split(";")
+        if item.strip()
+    ]
+
+    if not raw_configs:
+        raise ValueError("Informe pelo menos uma configuracao de matriz.")
+
+    return [
+        parse_matrix_config_text(item)
+        for item in raw_configs
+    ]
+
+
+def read_matrix_configs_from_input() -> list[tuple[int, int, int]]:
+    """Pergunta ao usuario as dimensoes de A e B de forma guiada."""
+    configs: list[tuple[int, int, int]] = []
+
+    print("[CLIENTE] Vamos configurar as matrizes para o teste.")
+
+    while True:
+        is_square = input("A matriz sera quadrada? (s/n): ").strip().lower()
+
+        if is_square in ("s", "sim"):
+            matrix_size = read_positive_int("Informe o tamanho n da matriz n x n: ")
+            configs.append((matrix_size, matrix_size, matrix_size))
+
+        elif is_square in ("n", "nao", "não"):
+            rows_a = read_positive_int("Informe a quantidade de linhas da Matriz A: ")
+            cols_a = read_positive_int("Informe a quantidade de colunas da Matriz A: ")
+
+            print(
+                f"A Matriz B precisa ter {cols_a} linhas "
+                "para ser compativel com A."
+            )
+
+            rows_b = read_positive_int("Informe a quantidade de linhas da Matriz B: ")
+
+            if rows_b != cols_a:
+                print(
+                    "Dimensoes invalidas: para A x B, "
+                    "colunas de A deve ser igual a linhas de B."
+                )
+                print(f"Voce informou A com {cols_a} colunas e B com {rows_b} linhas.")
+                print("Vamos tentar novamente.\n")
+                continue
+
+            cols_b = read_positive_int("Informe a quantidade de colunas da Matriz B: ")
+            configs.append((rows_a, cols_a, cols_b))
+
+        else:
+            print("Responda com 's' para sim ou 'n' para nao.\n")
+            continue
+
+        add_more = input("Deseja adicionar outro teste? (s/n): ").strip().lower()
+
+        if add_more not in ("s", "sim"):
+            break
+
+        print()
+
+    print("[CLIENTE] Configuracoes selecionadas:")
+    for rows_a, cols_a, cols_b in configs:
+        print(f"  A({rows_a}x{cols_a}) x B({cols_a}x{cols_b}) = C({rows_a}x{cols_b})")
+    print()
+    return configs
+
+
+def read_positive_int(prompt: str) -> int:
+    """Le um inteiro positivo do terminal."""
+    while True:
+        raw_value = input(prompt).strip()
+
+        try:
+            value = int(raw_value)
+        except ValueError:
+            print("Digite um numero inteiro valido.")
+            continue
+
+        if value <= 0:
+            print("Digite um numero maior que zero.")
+            continue
+
+        return value
+
+
 def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
@@ -586,6 +709,15 @@ def parse_args() -> argparse.Namespace:
         help="Host onde os servidores estao rodando.",
     )
 
+    parser.add_argument(
+        "--configs",
+        default=None,
+        help=(
+            "Opcional: configuracoes sem abrir input. Exemplos: "
+            "\"100\" ou \"20,10,30;50,25,60\"."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -609,6 +741,11 @@ def main() -> None:
     print()
     verify_servers(servers)
 
+    if args.configs:
+        matrix_configs = parse_matrix_configs(args.configs)
+    else:
+        matrix_configs = read_matrix_configs_from_input()
+
     last_run: dict[str, Any] = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "servers": [
@@ -618,7 +755,7 @@ def main() -> None:
         "matrices": {},
     }
 
-    for matrix_config in MATRIX_CONFIGS:
+    for matrix_config in matrix_configs:
 
         run_test(
             matrix_config,

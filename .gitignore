@@ -76,6 +76,7 @@ celerybeat-schedule
 # Environments
 .env
 .venv
+.venv-1/
 env/
 venv/
 ENV/
@@ -102,6 +103,7 @@ venv.bak/
 *.swo
 
 # Project specific
+server_logs/
 benchmark_results.csv
 *.csv
 

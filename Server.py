@@ -2,6 +2,7 @@
 Servidor do PROJETOCP - worker de multiplicacao distribuida.
 
 Uso:
+    python Server.py
     python Server.py 5000
 
 Cada conexao recebida e atendida em uma thread separada. O cliente envia uma
@@ -22,7 +23,9 @@ from typing import Any
 import numpy as np
 
 
-HOST = "127.0.0.1"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_START_PORT = 5000
+DEFAULT_NUM_SERVERS = 4
 HEADER_FORMAT = "!Q"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 SOCKET_TIMEOUT_SECONDS = 300
@@ -122,14 +125,14 @@ def handle_client(conn: socket.socket, addr: tuple[str, int], port: int) -> None
                 pass
 
 
-def run_server(port: int) -> None:
+def run_server(port: int, host: str = DEFAULT_HOST) -> None:
     """Inicia o servidor e aceita conexoes indefinidamente."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((HOST, port))
+        server_socket.bind((host, port))
         server_socket.listen()
 
-        print(f"[SERVIDOR porta={port}] Aguardando conexoes em {HOST}:{port}")
+        print(f"[SERVIDOR porta={port}] Aguardando conexoes em {host}:{port}")
 
         while True:
             try:
@@ -141,15 +144,77 @@ def run_server(port: int) -> None:
                 break
 
 
+def run_servers(num_servers: int, start_port: int, host: str) -> None:
+    """Inicia varios servidores em portas sequenciais no mesmo terminal."""
+    if num_servers < 1:
+        raise ValueError("--servers deve ser maior ou igual a 1.")
+
+    ports = [start_port + index for index in range(num_servers)]
+    print(
+        f"[SERVIDOR] Iniciando {num_servers} servidor(es) em "
+        f"{host}:{ports[0]} ate {host}:{ports[-1]}"
+    )
+
+    threads = [
+        threading.Thread(
+            target=run_server,
+            args=(port, host),
+            daemon=True,
+        )
+        for port in ports
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    print("[SERVIDOR] Pressione Ctrl+C para encerrar todos os servidores.")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[SERVIDOR] Encerrando todos os servidores...")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Servidor worker do PROJETOCP.")
-    parser.add_argument("port", type=int, help="Porta do servidor. Exemplo: python Server.py 5000")
+    parser.add_argument(
+        "port",
+        type=int,
+        nargs="?",
+        help=(
+            "Porta para iniciar apenas um servidor. "
+            "Sem informar porta, inicia 4 servidores automaticamente."
+        ),
+    )
+    parser.add_argument(
+        "--servers",
+        type=int,
+        default=DEFAULT_NUM_SERVERS,
+        help="Quantidade de servidores para iniciar automaticamente.",
+    )
+    parser.add_argument(
+        "--start-port",
+        type=int,
+        default=DEFAULT_START_PORT,
+        help="Primeira porta usada no modo automatico.",
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help="Host onde os servidores vao escutar conexoes.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run_server(args.port)
+
+    if args.port is not None:
+        run_server(args.port, args.host)
+        return
+
+    run_servers(args.servers, args.start_port, args.host)
 
 
 if __name__ == "__main__":

@@ -1,33 +1,35 @@
-# PROJETOCP - Multiplicação de Matrizes Distribuída
+# PROJETOCP - Multiplicacao de Matrizes Distribuida
 
-Projeto da disciplina de Computação Paralela e Concorrente. A aplicação simula
-uma arquitetura cliente-servidor para multiplicação distribuída de matrizes com
-Python, sockets e paralelismo interno nos servidores.
+Projeto da disciplina de Computacao Paralela e Concorrente. A aplicacao simula
+uma arquitetura cliente-servidor para multiplicacao distribuida de matrizes com
+Python, sockets e NumPy.
 
 ## Como funciona
 
-1. O cliente gera duas matrizes aleatórias `A` e `B` com NumPy.
-2. A matriz `A` é dividida verticalmente em partes, uma para cada servidor.
-3. Cada servidor recebe uma submatriz de `A` e a matriz `B` completa via socket.
-4. O servidor calcula `A_sub x B` usando threads internas.
-5. O cliente recebe todos os resultados parciais e concatena verticalmente para
-   montar a matriz final `C`.
-6. O cliente também executa `A x B` de forma serial/local e registra os tempos em
-   `benchmark_results.csv`.
+1. O cliente gera duas matrizes aleatorias `A` e `B`.
+2. A matriz `A` e dividida verticalmente em partes, uma para cada servidor.
+3. A matriz `B` e enviada completa para todos os servidores.
+4. Cada servidor calcula `A_sub x B` e devolve um resultado parcial.
+5. O cliente concatena os resultados parciais para montar a matriz final `C`.
+6. O cliente tambem executa `A x B` de forma serial/local para comparar tempos.
+7. Os resultados sao salvos em `benchmark_results.csv` e as matrizes da ultima
+   execucao sao salvas em `last_run_matrices.json`.
 
 ## Estrutura
 
 ```text
 PROJETOCP/
-├── Client.py
-├── Server.py
-├── benchmark_results.csv
-├── matrix_analysis.ipynb
-├── requirements.txt
-└── README.md
++-- Run.py
++-- Client.py
++-- Server.py
++-- benchmark_results.csv
++-- last_run_matrices.json
++-- matrix_analysis2.ipynb
++-- requirements.txt
++-- README.md
 ```
 
-## Instalação
+## Instalacao
 
 Crie e ative um ambiente virtual, se desejar:
 
@@ -36,84 +38,99 @@ python -m venv .venv
 .\.venv\Scripts\activate
 ```
 
-Instale as dependências:
+Instale as dependencias:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Executando os servidores
+## Execucao recomendada
 
-Abra um terminal para cada servidor. Exemplo com 4 servidores locais:
-
-```bash
-python Server.py 5000
-```
-
-Em outro terminal:
+Use o orquestrador:
 
 ```bash
-python Server.py 5001
+python Run.py
 ```
 
-Em outro terminal:
+O `Run.py` faz tudo em uma unica execucao:
+
+- pergunta quantos servidores voce quer usar;
+- pergunta a porta inicial;
+- inicia automaticamente os servidores;
+- pergunta se a matriz e quadrada ou nao;
+- executa o cliente;
+- salva os resultados;
+- encerra os servidores no final.
+
+Exemplo para matriz quadrada:
+
+```text
+Quantidade de servidores [4]:
+Porta inicial [5000]:
+A matriz sera quadrada? (s/n): s
+Informe o tamanho n da matriz n x n: 100
+Deseja adicionar outro teste? (s/n): n
+```
+
+Isso gera:
+
+```text
+A(100x100) x B(100x100) = C(100x100)
+```
+
+Exemplo para matriz nao quadrada:
+
+```text
+Quantidade de servidores [4]:
+Porta inicial [5000]:
+A matriz sera quadrada? (s/n): n
+Informe a quantidade de linhas da Matriz A: 100
+Informe a quantidade de colunas da Matriz A: 50
+A Matriz B precisa ter 50 linhas para ser compativel com A.
+Informe a quantidade de linhas da Matriz B: 50
+Informe a quantidade de colunas da Matriz B: 120
+Deseja adicionar outro teste? (s/n): n
+```
+
+Isso gera:
+
+```text
+A(100x50) x B(50x120) = C(100x120)
+```
+
+## Execucao manual opcional
+
+Se quiser iniciar os 4 servidores padrao em um unico terminal, execute:
 
 ```bash
-python Server.py 5002
+python Server.py
 ```
 
-Em outro terminal:
+Isso abre automaticamente as portas `5000`, `5001`, `5002` e `5003`.
 
-```bash
-python Server.py 5003
-```
-
-O servidor permanece aguardando conexões até ser encerrado com `Ctrl+C`.
-
-## Executando o cliente
-
-Com os servidores ativos, execute:
+Depois execute o cliente em outro terminal:
 
 ```bash
 python Client.py --servers 4 --start-port 5000
 ```
 
-O comando acima usa os 4 servidores nas portas `5000`, `5001`, `5002` e `5003`.
-O cliente testa automaticamente os tamanhos `20`, `50`, `100` e `200`.
-
-Se você abrir apenas 2 servidores, execute:
+Tambem e possivel passar as configuracoes sem input:
 
 ```bash
-python Client.py --servers 2 --start-port 5000
+python Client.py --servers 4 --start-port 5000 --configs "20,10,30;50,25,60;1000,2000,1000"
 ```
 
-Principais opções do cliente:
+Para mudar a quantidade de servidores ou a porta inicial:
 
-- `--servers`: quantidade de servidores em portas sequenciais.
-- `--start-port`: primeira porta usada quando `--servers` é informado.
-- `--host`: host onde os servidores estão rodando.
+```bash
+python Server.py --servers 6 --start-port 6000
+python Client.py --servers 6 --start-port 6000
+```
 
-## Resultado esperado
+Se quiser iniciar apenas uma porta especifica, ainda funciona:
 
-Exemplo de saída:
-
-```text
-[CLIENTE] Servidores configurados:
-  Servidor 1: localhost:5000
-  Servidor 2: localhost:5001
-  Servidor 3: localhost:5002
-  Servidor 4: localhost:5003
-
-============================================================
- TESTE: Matriz 20x20
-============================================================
-
-[CLIENTE] Matriz A gerada (20x20):
-...
-[CLIENTE] Dividindo A em 4 submatrizes (linhas por servidor: 5, 5, 5, 5)...
-[CLIENTE] Tempo Serial:      1 ms
-[CLIENTE] Tempo Distribuido: 8 ms
-[CLIENTE] Speedup:           0.12x
+```bash
+python Server.py 5000
 ```
 
 ## CSV de benchmark
@@ -124,32 +141,30 @@ O arquivo `benchmark_results.csv` usa as colunas:
 matrix_size,serial_time_ms,parallel_time_ms,speedup,num_servers,timestamp
 ```
 
-- `matrix_size`: tamanho `n` da matriz `n x n`.
-- `serial_time_ms`: tempo da multiplicação local `A @ B`.
-- `parallel_time_ms`: tempo total da versão distribuída, incluindo comunicação.
+- `matrix_size`: configuracao testada. Exemplo: `100x100x100` ou `100x50x120`.
+- `serial_time_ms`: tempo da multiplicacao local com NumPy.
+- `parallel_time_ms`: tempo total da versao distribuida, incluindo comunicacao.
 - `speedup`: `serial_time_ms / parallel_time_ms`.
 - `num_servers`: quantidade de servidores usados.
-- `timestamp`: data e hora da execução.
+- `timestamp`: data e hora da execucao.
 
-## Análise dos resultados
+## Analise dos resultados
 
 Abra o notebook:
 
 ```bash
-jupyter notebook matrix_analysis.ipynb
+jupyter notebook matrix_analysis2.ipynb
 ```
 
-O notebook carrega `benchmark_results.csv`, consolida médias quando há múltiplas
-execuções, gera gráficos comparativos e mostra o speedup para cada tamanho.
+O notebook carrega `benchmark_results.csv`, gera graficos comparativos, mostra o
+speedup e le `last_run_matrices.json` para exibir as matrizes da ultima execucao.
 
-Em matrizes pequenas, a comunicação por socket e a serialização com pickle podem
-pesar mais que o cálculo. Em matrizes maiores, a distribuição tende a ser mais
-vantajosa porque o custo da multiplicação passa a dominar o tempo total.
+## Observacoes tecnicas
 
-## Observações técnicas
-
-- Comunicação: módulo `socket`.
-- Serialização: `pickle` com cabeçalho binário de tamanho fixo.
-- Paralelismo no cliente: `ThreadPoolExecutor` para falar com servidores em paralelo.
-- Paralelismo no servidor: `ThreadPoolExecutor` para multiplicar blocos de linhas.
-- Validação: o cliente compara o resultado distribuído com o resultado serial.
+- Comunicacao: modulo `socket`.
+- Serializacao: `pickle` com cabecalho binario de tamanho fixo.
+- Distribuicao: a matriz `A` e dividida por linhas; a matriz `B` e enviada
+  completa para cada servidor.
+- Calculo no servidor: `np.dot(A_sub, B)`.
+- Validacao: o cliente compara o resultado distribuido com o resultado serial.
+- Logs dos servidores iniciados por `Run.py`: pasta `server_logs/`.
